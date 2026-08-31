@@ -53,6 +53,23 @@ def mealie_request(method, path, body=None):
         return json.loads(raw) if raw else None
 
 
+def week_bounds():
+    """Always resolves to a Monday..Sunday span, never a misaligned 7-day window.
+
+    On a Sunday (the day the real cron fires) this means NEXT week, since the
+    job's purpose is to prepare the upcoming week in advance. On any other day
+    (e.g. a startup dry-run, or a container restart mid-week) it means THIS
+    week -- so an already-generated plan (created by last Sunday's run) is
+    correctly found instead of skipped over.
+    """
+    today = date.today()
+    if today.weekday() == 6:  # Sunday
+        start = today + timedelta(days=1)
+    else:
+        start = today - timedelta(days=today.weekday())
+    return start, start + timedelta(days=6)
+
+
 def get_pool(category_slug, exclude_ids):
     qs = urllib.parse.urlencode(
         [("tags", LUNCH_TAG), ("tags", category_slug), ("requireAllTags", "true"), ("perPage", "100")]
@@ -61,42 +78,25 @@ def get_pool(category_slug, exclude_ids):
     return [r for r in data.get("items", []) if r["id"] not in exclude_ids]
 
 
-def clear_existing_lunches(start, end):
+def get_existing_lunches(start, end):
     qs = urllib.parse.urlencode(
         [("start_date", start.isoformat()), ("end_date", end.isoformat()), ("perPage", "100")]
     )
     data = mealie_request("GET", f"/api/households/mealplans?{qs}")
-    existing = [e for e in data.get("items", []) if e.get("entryType") == "lunch"]
-    for entry in existing:
+    entries = [e for e in data.get("items", []) if e.get("entryType") == "lunch"]
+    entries.sort(key=lambda e: e["date"])
+    return entries
+
+
+def clear_lunches(entries):
+    for entry in entries:
         mealie_request("DELETE", f"/api/households/mealplans/{entry['id']}")
-    if existing:
-        log(f"Cleared {len(existing)} existing lunch entries for {start}..{end}")
 
 
-def notify_ha(summary_lines, week_start, week_end):
-    text = "Το εβδομαδιαίο πρόγραμμα μεσημεριανών (" + week_start.isoformat() + " - " + week_end.isoformat() + "):\n" + "\n".join(summary_lines)
-    payload = {"text": text}
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(HA_WEBHOOK_URL, data=data, method="POST", headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=15)
-    except urllib.error.URLError as e:
-        log(f"ERROR: failed to notify HA webhook: {e}")
-
-
-def generate():
-    start = date.today() + timedelta(days=1)
-    end = start + timedelta(days=6)
-    log(f"Generating lunch plan for {start} .. {end}")
-
-    try:
-        clear_existing_lunches(start, end)
-    except Exception as e:
-        log(f"ERROR clearing existing entries: {e}")
-        return
-
+def pick_plan(start):
+    """Pure selection -- does not write anything to Mealie or Home Assistant."""
     used_ids = set()
-    summary_lines = []
+    plan = []
     for i, (tag_slug, tag_name) in enumerate(CATEGORY_ORDER):
         day = start + timedelta(days=i)
         day_label = GREEK_WEEKDAYS[day.weekday()]
@@ -104,43 +104,112 @@ def generate():
             pool = get_pool(tag_slug, used_ids)
         except Exception as e:
             log(f"ERROR fetching pool for {tag_name}: {e}")
+            pool = []
+        recipe = None
+        if pool:
+            recipe = random.choice(pool)
+            used_ids.add(recipe["id"])
+        else:
+            log(f"WARNING: no available recipes for {tag_name} ({tag_slug}) on {day}")
+        plan.append(
+            {"date": day, "day_label": day_label, "category_name": tag_name, "recipe": recipe}
+        )
+    return plan
+
+
+def format_summary(week_start, week_end, lines):
+    header = f"Το εβδομαδιαίο πρόγραμμα μεσημεριανών ({week_start.isoformat()} - {week_end.isoformat()}):"
+    return header + "\n" + "\n".join(lines)
+
+
+def notify_ha(text):
+    payload = {"text": text}
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        HA_WEBHOOK_URL, data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except urllib.error.URLError as e:
+        log(f"ERROR: failed to notify HA webhook: {e}")
+
+
+def generate(dry_run=False, force=False):
+    start, end = week_bounds()
+    log(f"[{'dry-run' if dry_run else 'run'}] Checking lunch plan for {start} .. {end}")
+
+    try:
+        existing = get_existing_lunches(start, end)
+    except Exception as e:
+        log(f"ERROR checking existing plan: {e}")
+        return
+
+    if existing and not force:
+        log(f"Plan for {start}..{end} already exists ({len(existing)} entries) -- not regenerating.")
+        lines = [
+            f"{GREEK_WEEKDAYS[date.fromisoformat(e['date']).weekday()]} ({e['date']}): "
+            f"{e['recipe']['name'] if e.get('recipe') else '?'}"
+            for e in existing
+        ]
+        text = format_summary(start, end, lines)
+        log(text)
+        if not dry_run:
+            notify_ha(text)
+        return
+
+    if force and existing:
+        log(f"--force: clearing {len(existing)} existing entries before regenerating")
+        clear_lunches(existing)
+
+    plan = pick_plan(start)
+    lines = [
+        f"{p['day_label']} ({p['category_name']}): "
+        f"{p['recipe']['name'] if p['recipe'] else '-- κανένα διαθέσιμο --'}"
+        for p in plan
+    ]
+    text = format_summary(start, end, lines)
+
+    if dry_run:
+        log("Would create the following plan (nothing written, no notification sent):")
+        log(text)
+        return
+
+    for p in plan:
+        if not p["recipe"]:
             continue
-        if not pool:
-            log(f"WARNING: no available recipes for {tag_name} ({tag_slug}) on {day} -- skipping")
-            summary_lines.append(f"{day_label} ({tag_name}): -- κανένα διαθέσιμο --")
-            continue
-        recipe = random.choice(pool)
-        used_ids.add(recipe["id"])
         try:
             mealie_request(
                 "POST",
                 "/api/households/mealplans",
-                {"date": day.isoformat(), "entryType": "lunch", "recipeId": recipe["id"]},
+                {"date": p["date"].isoformat(), "entryType": "lunch", "recipeId": p["recipe"]["id"]},
             )
+            log(f"{p['date']} [{p['category_name']}] -> {p['recipe']['name']}")
         except Exception as e:
-            log(f"ERROR creating mealplan entry for {day}: {e}")
-            summary_lines.append(f"{day_label} ({tag_name}): -- σφάλμα --")
-            continue
-        log(f"{day} [{tag_name}] -> {recipe['name']}")
-        summary_lines.append(f"{day_label} ({tag_name}): {recipe['name']}")
+            log(f"ERROR creating mealplan entry for {p['date']}: {e}")
 
-    notify_ha(summary_lines, start, end)
+    notify_ha(text)
     log("Done.")
 
 
 def main():
+    if "--dry-run" in sys.argv:
+        generate(dry_run=True)
+        return
     if "--once" in sys.argv:
-        generate()
+        generate(dry_run=False, force="--force" in sys.argv)
         return
 
     log(f"Started. CRON_SCHEDULE={CRON_SCHEDULE!r}")
+    log("Startup dry run (sanity check only -- writes nothing, notifies nothing):")
+    generate(dry_run=True)
+
     while True:
         nxt = croniter(CRON_SCHEDULE, time.time()).get_next(float)
         wait = max(0.0, nxt - time.time())
         log(f"Sleeping {wait / 3600:.1f}h until next run")
         time.sleep(wait)
         try:
-            generate()
+            generate(dry_run=False)
         except Exception as e:
             log(f"ERROR: generation run failed: {e}")
 
