@@ -20,7 +20,7 @@ MEALIE_TOKEN = os.environ["MEALIE_TOKEN"]
 HA_WEBHOOK_URL = os.environ["HA_WEBHOOK_URL"]
 CRON_SCHEDULE = os.environ.get("CRON_SCHEDULE", "0 18 * * 0")
 
-LUNCH_TAG = "diet4-lunch"
+LUNCH_CATEGORY = "mesemeriano"  # Mealie Category "Μεσημεριανό" -- the lunch-pool marker
 # Monday..Sunday. Each day lists one or more candidate tag slugs -- when a day
 # lists more than one (Friday: pork-or-beef, Saturday: fish-or-seafood), the
 # pools are combined and one recipe is picked from either, not both.
@@ -95,7 +95,7 @@ def week_bounds():
 
 def get_pool_for_tag(category_slug):
     qs = urllib.parse.urlencode(
-        [("tags", LUNCH_TAG), ("tags", category_slug), ("requireAllTags", "true"), ("perPage", "100")]
+        [("categories", LUNCH_CATEGORY), ("tags", category_slug), ("perPage", "100")]
     )
     data = mealie_request("GET", f"/api/recipes?{qs}")
     return data.get("items", [])
