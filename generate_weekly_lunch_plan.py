@@ -3,6 +3,7 @@ then notifies Home Assistant via webhook. Runs on a schedule (CRON_SCHEDULE)
 inside its own long-running process -- see README.md for the design.
 """
 import json
+import math
 import os
 import random
 import sys
@@ -44,6 +45,14 @@ TAG_NAMES = {
     "cheat-day": "Cheat day",
 }
 GREEK_WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
+
+SHOPPING_LIST_NAME = "Λίστα εβδομαδιαίων μεσημεριανών"
+TARGET_SERVINGS = 6
+# Mealie's own aisle-label taxonomy, bucketed into the user's 3 shopping stops.
+# Anything not in PRODUCE_LABELS or MEAT_LABELS falls through to groceries.
+PRODUCE_LABELS = {"Vegetables & Greens", "Fruits", "Herbs & Spices", "Mushrooms", "Berries"}
+MEAT_LABELS = {"Meats", "Poultry", "Fish", "Seafood & Seaweed"}
+BUCKET_ORDER = ["ΛΑΪΚΗ", "ΚΡΕΟΠΩΛΕΙΟ / ΙΧΘΥΟΠΩΛΕΙΟ", "ΣΟΥΠΕΡ ΜΑΡΚΕΤ"]
 
 
 def log(msg):
@@ -146,6 +155,147 @@ def pick_plan(start):
     return plan
 
 
+def bucket_for_label(label_name):
+    if label_name in PRODUCE_LABELS:
+        return "ΛΑΪΚΗ"
+    if label_name in MEAT_LABELS:
+        return "ΚΡΕΟΠΩΛΕΙΟ / ΙΧΘΥΟΠΩΛΕΙΟ"
+    return "ΣΟΥΠΕΡ ΜΑΡΚΕΤ"
+
+
+# Unit-name -> base-unit factor, so quantities in genuinely equivalent units
+# (e.g. olive oil measured in ml on one recipe, in litres on another) merge
+# into one clean, human-rounded line instead of separate odd-fraction ones.
+# Deliberately NOT included: κ.σ./κ.γ./φλ. (tablespoon/teaspoon/cup) -- those
+# are volume units too, but converting a spice's "1 κ.γ." into "5 ml" reads
+# as nonsense on a shopping list (you don't buy oregano by the millilitre),
+# and there's no reliable way here to tell a spoon of spice from a spoon of
+# oil. They're kept as their own literal unit in the "counts" group instead.
+WEIGHT_UNITS_G = {"γραμμάριο": 1.0, "κιλό": 1000.0, "χιλιοστόγραμμο": 0.001}
+VOLUME_UNITS_ML = {"ml": 1.0, "χιλιοστόλιτρο": 1.0, "λίτρο": 1000.0}
+
+
+def _fmt_num(n):
+    return str(int(n)) if n == int(n) else f"{n:g}"
+
+
+def round_weight(total_g):
+    if total_g >= 1000:
+        kg = round(total_g / 1000 * 4) / 4  # nearest 0.25 kg
+        return _fmt_num(kg), "κιλό" if kg == 1 else "κιλά"
+    g = round(total_g / 25) * 25  # nearest 25g
+    return _fmt_num(g), "γρ."
+
+
+def round_volume(total_ml):
+    if total_ml >= 1000:
+        l = round(total_ml / 1000 * 4) / 4  # nearest 0.25 L
+        return _fmt_num(l), "λίτρο" if l == 1 else "λίτρα"
+    ml = round(total_ml / 25) * 25  # nearest 25ml
+    return _fmt_num(ml), "ml"
+
+
+def get_or_create_shopping_list():
+    data = mealie_request("GET", "/api/households/shopping/lists?perPage=50")
+    for lst in data.get("items", []):
+        if lst["name"] == SHOPPING_LIST_NAME:
+            return lst["id"]
+    created = mealie_request("POST", "/api/households/shopping/lists", {"name": SHOPPING_LIST_NAME})
+    return created["id"]
+
+
+def clear_shopping_list(list_id):
+    data = mealie_request("GET", f"/api/households/shopping/lists/{list_id}")
+    ids = [i["id"] for i in data.get("listItems", [])]
+    if ids:
+        # `ids` is a repeated query param on this endpoint, NOT a JSON body
+        # field -- a JSON body here 200s but silently deletes nothing.
+        qs = urllib.parse.urlencode([("ids", i) for i in ids])
+        mealie_request("DELETE", f"/api/households/shopping/items?{qs}")
+
+
+def build_shopping_list(plan):
+    """Adds each picked recipe to a dedicated Mealie shopping list, scaled to
+    TARGET_SERVINGS, then reads back Mealie's own aggregated/labeled items and
+    formats them into the three shopping-stop buckets. Returns the message
+    text, or None if nothing could be built."""
+    recipes = [p["recipe"] for p in plan if p["recipe"]]
+    if not recipes:
+        return None
+
+    list_id = get_or_create_shopping_list()
+    clear_shopping_list(list_id)
+    for recipe in recipes:
+        servings = recipe.get("recipeServings") or TARGET_SERVINGS
+        scale = TARGET_SERVINGS / servings
+        try:
+            mealie_request(
+                "POST",
+                f"/api/households/shopping/lists/{list_id}/recipe/{recipe['id']}",
+                {"recipeIncrementQuantity": scale},
+            )
+        except Exception as e:
+            log(f"ERROR adding {recipe['name']} to shopping list: {e}")
+
+    data = mealie_request("GET", f"/api/households/shopping/lists/{list_id}")
+
+    # Group by (bucket, food name) across ALL units first, splitting each
+    # group's quantities into weight/volume/plain-count buckets so e.g. olive
+    # oil in ml on one recipe and tablespoons on another merge into one line.
+    grouped = {}
+    for item in data.get("listItems", []):
+        food = item.get("food")
+        name = food["name"] if food else (item.get("note") or None)
+        if not name:
+            continue
+        label_name = (food.get("label") or {}).get("name") if food else None
+        unit = item.get("unit")
+        unit_name = unit["name"] if unit else None
+        qty = item.get("quantity") or 0
+        g = grouped.setdefault((bucket_for_label(label_name), name), {"weight": 0.0, "volume": 0.0, "counts": {}})
+        if unit_name in WEIGHT_UNITS_G:
+            g["weight"] += qty * WEIGHT_UNITS_G[unit_name]
+        elif unit_name in VOLUME_UNITS_ML:
+            g["volume"] += qty * VOLUME_UNITS_ML[unit_name]
+        else:
+            g["counts"][unit_name] = g["counts"].get(unit_name, 0.0) + qty
+
+    buckets = {b: [] for b in BUCKET_ORDER}
+    for (bucket, name), g in grouped.items():
+        parts = []
+        if g["weight"] > 0:
+            parts.append(round_weight(g["weight"]))
+        if g["volume"] > 0:
+            parts.append(round_volume(g["volume"]))
+        for unit_name, qty in g["counts"].items():
+            if qty <= 0:
+                continue
+            # Garlic by the clove reads better converted to heads (~10/head)
+            # -- a common enough case in this recipe pool to special-case.
+            if name == "σκόρδο" and unit_name == "σκελίδα" and qty >= 6:
+                heads = math.ceil(qty / 10)
+                parts.append((str(heads), "κεφάλι" if heads == 1 else "κεφάλια"))
+            else:
+                parts.append((str(math.ceil(qty)), unit_name or ""))
+        if not parts:
+            continue
+        if len(parts) == 1:
+            num, unit = parts[0]
+            line = f"{num} {unit} {name}".strip() if unit else f"{num} {name}"
+        else:
+            line = f"{name}: " + " + ".join(f"{num} {unit}".strip() for num, unit in parts)
+        buckets[bucket].append(line)
+
+    lines = [f"Λίστα ψωνιών για την εβδομάδα ({TARGET_SERVINGS} άτομα):"]
+    for bucket_name in BUCKET_ORDER:
+        items = sorted(buckets[bucket_name])
+        if not items:
+            continue
+        lines.append(f"\n{bucket_name}:")
+        lines.extend(f"- {it}" for it in items)
+    return "\n".join(lines)
+
+
 def format_summary(week_start, week_end, lines):
     header = f"Το εβδομαδιαίο πρόγραμμα μεσημεριανών ({week_start.isoformat()} - {week_end.isoformat()}):"
     return header + "\n" + "\n".join(lines)
@@ -184,6 +334,10 @@ def generate(dry_run=False, force=False):
         log(text)
         if not dry_run:
             notify_ha(text)
+            shopping_plan = [{"recipe": e.get("recipe")} for e in existing]
+            shopping_text = build_shopping_list(shopping_plan)
+            if shopping_text:
+                notify_ha(shopping_text)
         return
 
     if force and existing:
@@ -217,6 +371,11 @@ def generate(dry_run=False, force=False):
             log(f"ERROR creating mealplan entry for {p['date']}: {e}")
 
     notify_ha(text)
+
+    shopping_text = build_shopping_list(plan)
+    if shopping_text:
+        notify_ha(shopping_text)
+
     log("Done.")
 
 
