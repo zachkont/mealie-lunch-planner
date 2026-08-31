@@ -20,15 +20,29 @@ HA_WEBHOOK_URL = os.environ["HA_WEBHOOK_URL"]
 CRON_SCHEDULE = os.environ.get("CRON_SCHEDULE", "0 18 * * 0")
 
 LUNCH_TAG = "diet4-lunch"
+# Monday..Sunday. Each day lists one or more candidate tag slugs -- when a day
+# lists more than one (Friday: pork-or-beef, Saturday: fish-or-seafood), the
+# pools are combined and one recipe is picked from either, not both.
 CATEGORY_ORDER = [
-    ("ospria", "Όσπρια"),
-    ("zumarika", "Ζυμαρικά"),
-    ("kotopoulo", "Κοτόπουλο"),
-    ("psari", "Ψάρι"),
-    ("ladera", "Λαδερά"),
-    ("khoirino-moskhari", "Χοιρινό/Μοσχάρι"),
-    ("cheat-day", "Cheat day"),
+    ["ospria"],              # Monday: legumes
+    ["kotopoulo"],           # Tuesday: chicken
+    ["ladera"],               # Wednesday: λαδερά
+    ["zumarika"],             # Thursday: pasta
+    ["khoirino", "moskhari"],  # Friday: pork OR beef
+    ["psari", "thalassina"],   # Saturday: fish OR seafood
+    ["cheat-day"],            # Sunday: cheat day
 ]
+TAG_NAMES = {
+    "ospria": "Όσπρια",
+    "kotopoulo": "Κοτόπουλο",
+    "ladera": "Λαδερά",
+    "zumarika": "Ζυμαρικά",
+    "khoirino": "Χοιρινό",
+    "moskhari": "Μοσχάρι",
+    "psari": "Ψάρι",
+    "thalassina": "Θαλασσινά",
+    "cheat-day": "Cheat day",
+}
 GREEK_WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
 
 
@@ -70,12 +84,24 @@ def week_bounds():
     return start, start + timedelta(days=6)
 
 
-def get_pool(category_slug, exclude_ids):
+def get_pool_for_tag(category_slug):
     qs = urllib.parse.urlencode(
         [("tags", LUNCH_TAG), ("tags", category_slug), ("requireAllTags", "true"), ("perPage", "100")]
     )
     data = mealie_request("GET", f"/api/recipes?{qs}")
-    return [r for r in data.get("items", []) if r["id"] not in exclude_ids]
+    return data.get("items", [])
+
+
+def get_pool(category_slugs, exclude_ids):
+    """Union of the pools for each candidate tag (OR across slugs, e.g.
+    pork-or-beef), deduped by recipe id, minus recipes already used this run."""
+    seen = {}
+    for slug in category_slugs:
+        for r in get_pool_for_tag(slug):
+            if r["id"] not in seen:
+                r["_source_tag"] = slug
+                seen[r["id"]] = r
+    return [r for r in seen.values() if r["id"] not in exclude_ids]
 
 
 def get_existing_lunches(start, end):
@@ -97,22 +123,25 @@ def pick_plan(start):
     """Pure selection -- does not write anything to Mealie or Home Assistant."""
     used_ids = set()
     plan = []
-    for i, (tag_slug, tag_name) in enumerate(CATEGORY_ORDER):
+    for i, tag_slugs in enumerate(CATEGORY_ORDER):
         day = start + timedelta(days=i)
         day_label = GREEK_WEEKDAYS[day.weekday()]
+        combined_label = "/".join(TAG_NAMES[s] for s in tag_slugs)
         try:
-            pool = get_pool(tag_slug, used_ids)
+            pool = get_pool(tag_slugs, used_ids)
         except Exception as e:
-            log(f"ERROR fetching pool for {tag_name}: {e}")
+            log(f"ERROR fetching pool for {combined_label}: {e}")
             pool = []
         recipe = None
+        category_name = combined_label
         if pool:
             recipe = random.choice(pool)
             used_ids.add(recipe["id"])
+            category_name = TAG_NAMES[recipe["_source_tag"]]
         else:
-            log(f"WARNING: no available recipes for {tag_name} ({tag_slug}) on {day}")
+            log(f"WARNING: no available recipes for {combined_label} ({tag_slugs}) on {day}")
         plan.append(
-            {"date": day, "day_label": day_label, "category_name": tag_name, "recipe": recipe}
+            {"date": day, "day_label": day_label, "category_name": category_name, "recipe": recipe}
         )
     return plan
 
