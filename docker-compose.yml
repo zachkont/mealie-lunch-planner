@@ -1,0 +1,10 @@
+services:
+  planner:
+    build: .
+    container_name: mealie-lunch-planner
+    restart: unless-stopped
+    env_file:
+      - .env
+    # host networking: Home Assistant runs with network_mode: host on this box,
+    # so this is the simplest way to reach its webhook at localhost:8123.
+    network_mode: host
