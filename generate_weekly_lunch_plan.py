@@ -155,6 +155,10 @@ def pick_plan(start):
     return plan
 
 
+# Things that show up as recipe "ingredients" but aren't actually purchased.
+EXCLUDED_FOODS = {"νερό"}
+
+
 def bucket_for_label(label_name):
     if label_name in PRODUCE_LABELS:
         return "ΛΑΪΚΗ"
@@ -246,7 +250,7 @@ def build_shopping_list(plan):
     for item in data.get("listItems", []):
         food = item.get("food")
         name = food["name"] if food else (item.get("note") or None)
-        if not name:
+        if not name or name in EXCLUDED_FOODS:
             continue
         label_name = (food.get("label") or {}).get("name") if food else None
         unit = item.get("unit")
