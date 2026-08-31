@@ -1,10 +1,13 @@
 services:
   planner:
-    build: .
+    image: ghcr.io/zachkont/mealie-lunch-planner:latest
     container_name: mealie-lunch-planner
     restart: unless-stopped
-    env_file:
-      - .env
     # host networking: Home Assistant runs with network_mode: host on this box,
     # so this is the simplest way to reach its webhook at localhost:8123.
     network_mode: host
+    environment:
+      - MEALIE_URL=${MEALIE_URL}
+      - MEALIE_TOKEN=${MEALIE_TOKEN}
+      - HA_WEBHOOK_URL=${HA_WEBHOOK_URL}
+      - CRON_SCHEDULE=${CRON_SCHEDULE}
