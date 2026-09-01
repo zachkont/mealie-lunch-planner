@@ -155,8 +155,13 @@ def pick_plan(start):
     return plan
 
 
-# Things that show up as recipe "ingredients" but aren't actually purchased.
-EXCLUDED_FOODS = {"νερό"}
+def is_on_hand(food):
+    """True if this Food is marked 'on hand' (pantry staple) for any household
+    in Mealie. Mealie's own add-recipe-to-list endpoint doesn't actually skip
+    these itself (tested -- an on-hand food still comes back in the list,
+    unchecked, same as everything else), so we honor the flag ourselves here
+    instead of hardcoding an exclusion list."""
+    return bool(food and food.get("householdsWithIngredientFood"))
 
 
 def bucket_for_label(label_name):
@@ -250,7 +255,7 @@ def build_shopping_list(plan):
     for item in data.get("listItems", []):
         food = item.get("food")
         name = food["name"] if food else (item.get("note") or None)
-        if not name or name in EXCLUDED_FOODS:
+        if not name or is_on_hand(food):
             continue
         label_name = (food.get("label") or {}).get("name") if food else None
         unit = item.get("unit")
