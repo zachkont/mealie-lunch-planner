@@ -400,15 +400,21 @@ def main():
     log("Startup dry run (sanity check only -- writes nothing, notifies nothing):")
     generate(dry_run=True)
 
+    POLL_INTERVAL = 60  # seconds -- keeps drift from long sleeps/suspends/clock jumps bounded
+
+    nxt = croniter(CRON_SCHEDULE, time.time()).get_next(float)
+    log(f"Next run at {time.ctime(nxt)}")
     while True:
-        nxt = croniter(CRON_SCHEDULE, time.time()).get_next(float)
-        wait = max(0.0, nxt - time.time())
-        log(f"Sleeping {wait / 3600:.1f}h until next run")
-        time.sleep(wait)
-        try:
-            generate(dry_run=False)
-        except Exception as e:
-            log(f"ERROR: generation run failed: {e}")
+        now = time.time()
+        if now >= nxt:
+            try:
+                generate(dry_run=False)
+            except Exception as e:
+                log(f"ERROR: generation run failed: {e}")
+            nxt = croniter(CRON_SCHEDULE, time.time()).get_next(float)
+            log(f"Next run at {time.ctime(nxt)}")
+            continue
+        time.sleep(min(POLL_INTERVAL, nxt - now))
 
 
 if __name__ == "__main__":
