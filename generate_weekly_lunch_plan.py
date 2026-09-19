@@ -76,18 +76,31 @@ def mealie_request(method, path, body=None):
         return json.loads(raw) if raw else None
 
 
+def _cron_run_weekdays(schedule):
+    """The Python weekday()s (Mon=0..Sun=6) this cron schedule fires on, read
+    from its day-of-week field -- so week_bounds() tracks CRON_SCHEDULE
+    instead of assuming the job always runs on Sunday. Falls back to Sunday
+    if the field is '*' (no specific day pinned), keeping the old default
+    behavior for a schedule that doesn't restrict by weekday."""
+    dow_field = croniter(schedule).expanded[4]
+    if dow_field == ["*"]:
+        return {6}
+    # cron dow: 0/7=Sunday..6=Saturday -> Python weekday: Mon=0..Sun=6
+    return {(d - 1) % 7 for d in dow_field}
+
+
 def week_bounds():
     """Always resolves to a Monday..Sunday span, never a misaligned 7-day window.
 
-    On a Sunday (the day the real cron fires) this means NEXT week, since the
-    job's purpose is to prepare the upcoming week in advance. On any other day
-    (e.g. a startup dry-run, or a container restart mid-week) it means THIS
-    week -- so an already-generated plan (created by last Sunday's run) is
-    correctly found instead of skipped over.
+    On a day the cron schedule actually fires (per CRON_SCHEDULE) this means
+    NEXT week, since the job's purpose is to prepare the upcoming week in
+    advance. On any other day (e.g. a startup dry-run, or a container restart
+    mid-week) it means THIS week -- so an already-generated plan (created by
+    the previous run) is correctly found instead of skipped over.
     """
     today = date.today()
-    if today.weekday() == 6:  # Sunday
-        start = today + timedelta(days=1)
+    if today.weekday() in _cron_run_weekdays(CRON_SCHEDULE):
+        start = today + timedelta(days=7 - today.weekday())
     else:
         start = today - timedelta(days=today.weekday())
     return start, start + timedelta(days=6)
