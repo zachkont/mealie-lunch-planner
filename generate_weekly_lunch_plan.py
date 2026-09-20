@@ -1,10 +1,13 @@
 """Generates next week's lunch meal plan in Mealie from tagged recipe pools,
-then notifies Home Assistant via webhook. Runs on a schedule (CRON_SCHEDULE)
-inside its own long-running process -- see README.md for the design.
+then notifies over Telegram. Runs on a schedule (CRON_SCHEDULE) inside its
+own long-running process -- see README.md for the design.
 
-Optionally also runs a Telegram bot (long-polling, so no inbound port is
-needed) exposing /generate, /regenerate, /sendplan and /sendshopping for
-on-demand control -- see the "Telegram bot" section near the bottom.
+Also runs a Telegram bot (long-polling, so no inbound port is needed)
+exposing /generate, /regenerate, /sendplan and /sendshopping for on-demand
+control -- see the "Telegram bot" section near the bottom. This must be a
+bot dedicated to this script: Telegram allows only one getUpdates poller
+per bot token, so sharing a token with e.g. Home Assistant's telegram_bot
+integration will make both flaky.
 """
 import json
 import math
@@ -22,14 +25,20 @@ from croniter import croniter
 
 MEALIE_URL = os.environ["MEALIE_URL"].rstrip("/")
 MEALIE_TOKEN = os.environ["MEALIE_TOKEN"]
-HA_WEBHOOK_URL = os.environ["HA_WEBHOOK_URL"]
 CRON_SCHEDULE = os.environ.get("CRON_SCHEDULE", "0 18 * * 0")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # Numeric Telegram user id -- the only user whose commands the bot will act
-# on. BotFather has no equivalent "restrict who can DM this bot" setting of
-# its own, so this in-app check is the actual access control, not a backup.
-_allowed_user_env = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
-TELEGRAM_ALLOWED_USER_ID = int(_allowed_user_env) if _allowed_user_env else None
+# on, and the default notification recipient. BotFather has no equivalent
+# "restrict who can DM this bot" setting of its own, so this in-app check
+# is the actual access control, not a backup.
+TELEGRAM_ALLOWED_USER_ID = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
+# Comma-separated chat ids to notify on each scheduled/on-demand generation
+# (e.g. "111111,222222"). Defaults to just TELEGRAM_ALLOWED_USER_ID when unset.
+_notify_ids_env = os.environ.get("TELEGRAM_NOTIFY_CHAT_IDS", "")
+TELEGRAM_NOTIFY_CHAT_IDS = (
+    [int(x.strip()) for x in _notify_ids_env.split(",") if x.strip()]
+    or [TELEGRAM_ALLOWED_USER_ID]
+)
 
 LUNCH_CATEGORY = "mesemeriano"  # Mealie Category "Μεσημεριανό" -- the lunch-pool marker
 # Monday..Sunday. Each day lists one or more candidate tag slugs -- when a day
@@ -153,7 +162,7 @@ def clear_lunches(entries):
 
 
 def pick_plan(start):
-    """Pure selection -- does not write anything to Mealie or Home Assistant."""
+    """Pure selection -- does not write anything to Mealie or notify anyone."""
     used_ids = set()
     plan = []
     for i, tag_slugs in enumerate(CATEGORY_ORDER):
@@ -334,18 +343,6 @@ def format_summary(week_start, week_end, lines):
     return header + "\n" + "\n".join(lines)
 
 
-def notify_ha(text):
-    payload = {"text": text}
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        HA_WEBHOOK_URL, data=data, method="POST", headers={"Content-Type": "application/json"}
-    )
-    try:
-        urllib.request.urlopen(req, timeout=15)
-    except urllib.error.URLError as e:
-        log(f"ERROR: failed to notify HA webhook: {e}")
-
-
 def existing_entries_lines(entries):
     return [
         f"{GREEK_WEEKDAYS[date.fromisoformat(e['date']).weekday()]} ({e['date']}): "
@@ -392,11 +389,11 @@ def generate(dry_run=False, force=False):
         text = format_summary(start, end, existing_entries_lines(existing))
         log(text)
         if not dry_run:
-            notify_ha(text)
+            telegram_notify(text)
             shopping_plan = [{"recipe": e.get("recipe")} for e in existing]
             shopping_text = build_shopping_list(shopping_plan)
             if shopping_text:
-                notify_ha(shopping_text)
+                telegram_notify(shopping_text)
         return
 
     if force and existing:
@@ -412,20 +409,20 @@ def generate(dry_run=False, force=False):
         return
 
     write_plan_to_mealie(plan)
-    notify_ha(text)
+    telegram_notify(text)
 
     shopping_text = build_shopping_list(plan)
     if shopping_text:
-        notify_ha(shopping_text)
+        telegram_notify(shopping_text)
 
     log("Done.")
 
 
 # --- Telegram bot -----------------------------------------------------------
 # Long-polling (getUpdates), not a webhook -- the container has no inbound
-# port to receive one. Commands reply directly in the requesting chat; they
-# never touch HA_WEBHOOK_URL, which stays reserved for the scheduled run.
-# Only enabled when TELEGRAM_BOT_TOKEN is set.
+# port to receive one. Scheduled/on-demand generation notifies every chat id
+# in TELEGRAM_NOTIFY_CHAT_IDS; interactive command replies go only to the
+# chat that issued the command.
 
 TELEGRAM_HELP = (
     "/generate — create next week's plan if one doesn't exist yet\n"
@@ -452,9 +449,17 @@ def telegram_send(chat_id, text):
         log(f"ERROR sending Telegram message: {e}")
 
 
+def telegram_notify(text):
+    """Broadcasts to every chat id in TELEGRAM_NOTIFY_CHAT_IDS -- used for
+    the scheduled/on-demand generation results, as opposed to telegram_send()
+    which replies to a single command's originating chat."""
+    for chat_id in TELEGRAM_NOTIFY_CHAT_IDS:
+        telegram_send(chat_id, text)
+
+
 def telegram_cmd_generate(force):
     """Shared body of /generate and /regenerate -- mirrors generate()'s
-    plan-or-reuse logic but returns reply text instead of notifying HA."""
+    plan-or-reuse logic but returns reply text instead of notifying."""
     start, end = week_bounds()
     existing = get_existing_lunches(start, end)
 
@@ -577,10 +582,7 @@ def main():
     log("Startup dry run (sanity check only -- writes nothing, notifies nothing):")
     generate(dry_run=True)
 
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID:
-        threading.Thread(target=telegram_poll_loop, daemon=True).start()
-    elif TELEGRAM_BOT_TOKEN:
-        log("WARNING: TELEGRAM_BOT_TOKEN set but TELEGRAM_ALLOWED_USER_ID is missing -- Telegram bot disabled")
+    threading.Thread(target=telegram_poll_loop, daemon=True).start()
 
     POLL_INTERVAL = 60  # seconds -- keeps drift from long sleeps/suspends/clock jumps bounded
 
