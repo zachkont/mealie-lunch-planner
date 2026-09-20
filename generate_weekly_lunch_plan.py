@@ -120,9 +120,8 @@ def week_bounds():
     """
     today = date.today()
     if today.weekday() in _cron_run_weekdays(CRON_SCHEDULE):
-        start = today + timedelta(days=7 - today.weekday())
-    else:
-        start = today - timedelta(days=today.weekday())
+        return next_week_bounds()
+    start = today - timedelta(days=today.weekday())
     return start, start + timedelta(days=6)
 
 
@@ -547,7 +546,7 @@ def telegram_poll_loop():
             params = {"timeout": 30}
             if offset is not None:
                 params["offset"] = offset
-            resp = telegram_api_request("getUpdates", params, timeout=40)
+            resp = telegram_api_request("getUpdates", params)
         except urllib.error.HTTPError as e:
             if e.code == 409:
                 # Telegram allows only one getUpdates poller per bot token --
