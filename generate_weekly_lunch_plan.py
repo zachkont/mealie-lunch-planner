@@ -1,12 +1,17 @@
 """Generates next week's lunch meal plan in Mealie from tagged recipe pools,
 then notifies Home Assistant via webhook. Runs on a schedule (CRON_SCHEDULE)
 inside its own long-running process -- see README.md for the design.
+
+Optionally also runs a Telegram bot (long-polling, so no inbound port is
+needed) exposing /generate, /regenerate, /sendplan and /sendshopping for
+on-demand control -- see the "Telegram bot" section near the bottom.
 """
 import json
 import math
 import os
 import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,6 +24,12 @@ MEALIE_URL = os.environ["MEALIE_URL"].rstrip("/")
 MEALIE_TOKEN = os.environ["MEALIE_TOKEN"]
 HA_WEBHOOK_URL = os.environ["HA_WEBHOOK_URL"]
 CRON_SCHEDULE = os.environ.get("CRON_SCHEDULE", "0 18 * * 0")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# Numeric Telegram user id -- the only user whose commands the bot will act
+# on. BotFather has no equivalent "restrict who can DM this bot" setting of
+# its own, so this in-app check is the actual access control, not a backup.
+_allowed_user_env = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
+TELEGRAM_ALLOWED_USER_ID = int(_allowed_user_env) if _allowed_user_env else None
 
 LUNCH_CATEGORY = "mesemeriano"  # Mealie Category "Μεσημεριανό" -- the lunch-pool marker
 # Monday..Sunday. Each day lists one or more candidate tag slugs -- when a day
@@ -335,6 +346,37 @@ def notify_ha(text):
         log(f"ERROR: failed to notify HA webhook: {e}")
 
 
+def existing_entries_lines(entries):
+    return [
+        f"{GREEK_WEEKDAYS[date.fromisoformat(e['date']).weekday()]} ({e['date']}): "
+        f"{e['recipe']['name'] if e.get('recipe') else '?'}"
+        for e in entries
+    ]
+
+
+def picked_plan_lines(plan):
+    return [
+        f"{p['day_label']} ({p['category_name']}): "
+        f"{p['recipe']['name'] if p['recipe'] else '-- κανένα διαθέσιμο --'}"
+        for p in plan
+    ]
+
+
+def write_plan_to_mealie(plan):
+    for p in plan:
+        if not p["recipe"]:
+            continue
+        try:
+            mealie_request(
+                "POST",
+                "/api/households/mealplans",
+                {"date": p["date"].isoformat(), "entryType": "lunch", "recipeId": p["recipe"]["id"]},
+            )
+            log(f"{p['date']} [{p['category_name']}] -> {p['recipe']['name']}")
+        except Exception as e:
+            log(f"ERROR creating mealplan entry for {p['date']}: {e}")
+
+
 def generate(dry_run=False, force=False):
     start, end = week_bounds()
     log(f"[{'dry-run' if dry_run else 'run'}] Checking lunch plan for {start} .. {end}")
@@ -347,12 +389,7 @@ def generate(dry_run=False, force=False):
 
     if existing and not force:
         log(f"Plan for {start}..{end} already exists ({len(existing)} entries) -- not regenerating.")
-        lines = [
-            f"{GREEK_WEEKDAYS[date.fromisoformat(e['date']).weekday()]} ({e['date']}): "
-            f"{e['recipe']['name'] if e.get('recipe') else '?'}"
-            for e in existing
-        ]
-        text = format_summary(start, end, lines)
+        text = format_summary(start, end, existing_entries_lines(existing))
         log(text)
         if not dry_run:
             notify_ha(text)
@@ -367,31 +404,14 @@ def generate(dry_run=False, force=False):
         clear_lunches(existing)
 
     plan = pick_plan(start)
-    lines = [
-        f"{p['day_label']} ({p['category_name']}): "
-        f"{p['recipe']['name'] if p['recipe'] else '-- κανένα διαθέσιμο --'}"
-        for p in plan
-    ]
-    text = format_summary(start, end, lines)
+    text = format_summary(start, end, picked_plan_lines(plan))
 
     if dry_run:
         log("Would create the following plan (nothing written, no notification sent):")
         log(text)
         return
 
-    for p in plan:
-        if not p["recipe"]:
-            continue
-        try:
-            mealie_request(
-                "POST",
-                "/api/households/mealplans",
-                {"date": p["date"].isoformat(), "entryType": "lunch", "recipeId": p["recipe"]["id"]},
-            )
-            log(f"{p['date']} [{p['category_name']}] -> {p['recipe']['name']}")
-        except Exception as e:
-            log(f"ERROR creating mealplan entry for {p['date']}: {e}")
-
+    write_plan_to_mealie(plan)
     notify_ha(text)
 
     shopping_text = build_shopping_list(plan)
@@ -399,6 +419,130 @@ def generate(dry_run=False, force=False):
         notify_ha(shopping_text)
 
     log("Done.")
+
+
+# --- Telegram bot -----------------------------------------------------------
+# Long-polling (getUpdates), not a webhook -- the container has no inbound
+# port to receive one. Commands reply directly in the requesting chat; they
+# never touch HA_WEBHOOK_URL, which stays reserved for the scheduled run.
+# Only enabled when TELEGRAM_BOT_TOKEN is set.
+
+TELEGRAM_HELP = (
+    "/generate — create next week's plan if one doesn't exist yet\n"
+    "/regenerate confirm — discard the current plan and pick a new one\n"
+    "/sendplan — resend the day-by-day plan for the current target week\n"
+    "/sendshopping — resend the shopping list for the current target week"
+)
+
+
+def telegram_api_request(method, params, timeout=40):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = json.dumps(params).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def telegram_send(chat_id, text):
+    try:
+        telegram_api_request("sendMessage", {"chat_id": chat_id, "text": text}, timeout=15)
+    except Exception as e:
+        log(f"ERROR sending Telegram message: {e}")
+
+
+def telegram_cmd_generate(force):
+    """Shared body of /generate and /regenerate -- mirrors generate()'s
+    plan-or-reuse logic but returns reply text instead of notifying HA."""
+    start, end = week_bounds()
+    existing = get_existing_lunches(start, end)
+
+    if existing and not force:
+        text = format_summary(start, end, existing_entries_lines(existing))
+        return f"Plan for {start}..{end} already exists -- not regenerating:\n\n{text}"
+
+    if force and existing:
+        log(f"Telegram: clearing {len(existing)} existing entries before regenerating")
+        clear_lunches(existing)
+
+    plan = pick_plan(start)
+    write_plan_to_mealie(plan)
+    text = format_summary(start, end, picked_plan_lines(plan))
+    return f"Generated:\n\n{text}"
+
+
+def telegram_cmd_sendplan():
+    start, end = week_bounds()
+    existing = get_existing_lunches(start, end)
+    if not existing:
+        return f"No plan exists yet for {start}..{end}. Use /generate first."
+    return format_summary(start, end, existing_entries_lines(existing))
+
+
+def telegram_cmd_sendshopping():
+    start, end = week_bounds()
+    existing = get_existing_lunches(start, end)
+    shopping_plan = [{"recipe": e.get("recipe")} for e in existing]
+    text = build_shopping_list(shopping_plan)
+    if not text:
+        return f"No shopping list available yet for {start}..{end}. Use /generate first."
+    return text
+
+
+def handle_telegram_command(chat_id, text):
+    cmd, _, arg = text.strip().partition(" ")
+    cmd = cmd.split("@", 1)[0]  # strip the @botname suffix some clients append
+    arg = arg.strip()
+
+    if cmd in ("/start", "/help"):
+        telegram_send(chat_id, TELEGRAM_HELP)
+    elif cmd == "/generate":
+        telegram_send(chat_id, telegram_cmd_generate(force=False))
+    elif cmd == "/regenerate":
+        if arg != "confirm":
+            telegram_send(
+                chat_id,
+                'This discards the current plan for the target week. '
+                'Send "/regenerate confirm" to proceed.',
+            )
+        else:
+            telegram_send(chat_id, telegram_cmd_generate(force=True))
+    elif cmd == "/sendplan":
+        telegram_send(chat_id, telegram_cmd_sendplan())
+    elif cmd == "/sendshopping":
+        telegram_send(chat_id, telegram_cmd_sendshopping())
+
+
+def telegram_poll_loop():
+    log("Telegram bot: starting long-poll loop")
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            resp = telegram_api_request("getUpdates", params, timeout=40)
+        except Exception as e:
+            log(f"ERROR polling Telegram: {e}")
+            time.sleep(5)
+            continue
+
+        for update in resp.get("result", []):
+            offset = update["update_id"] + 1
+            message = update.get("message") or update.get("edited_message")
+            if not message or "text" not in message:
+                continue
+            from_id = (message.get("from") or {}).get("id")
+            chat_id = message["chat"]["id"]
+            if from_id != TELEGRAM_ALLOWED_USER_ID:
+                log(f"Telegram: ignoring command from unauthorized user id {from_id}")
+                continue
+            try:
+                handle_telegram_command(chat_id, message["text"])
+            except Exception as e:
+                log(f"ERROR handling Telegram command {message['text']!r}: {e}")
+                telegram_send(chat_id, f"Error: {e}")
 
 
 def main():
@@ -412,6 +556,11 @@ def main():
     log(f"Started. CRON_SCHEDULE={CRON_SCHEDULE!r}")
     log("Startup dry run (sanity check only -- writes nothing, notifies nothing):")
     generate(dry_run=True)
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID:
+        threading.Thread(target=telegram_poll_loop, daemon=True).start()
+    elif TELEGRAM_BOT_TOKEN:
+        log("WARNING: TELEGRAM_BOT_TOKEN set but TELEGRAM_ALLOWED_USER_ID is missing -- Telegram bot disabled")
 
     POLL_INTERVAL = 60  # seconds -- keeps drift from long sleeps/suspends/clock jumps bounded
 
