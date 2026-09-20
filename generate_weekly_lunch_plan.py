@@ -126,6 +126,17 @@ def week_bounds():
     return start, start + timedelta(days=6)
 
 
+def next_week_bounds():
+    """Monday..Sunday of the week AFTER the one containing today, regardless
+    of what day it is. Used by the Telegram /generate, /regenerate,
+    /sendplan and /sendshopping commands, which are always about planning
+    ahead -- unlike week_bounds(), which is tied to CRON_SCHEDULE for the
+    unattended run."""
+    today = date.today()
+    start = today + timedelta(days=7 - today.weekday())
+    return start, start + timedelta(days=6)
+
+
 def get_pool_for_tag(category_slug):
     qs = urllib.parse.urlencode(
         [("categories", LUNCH_CATEGORY), ("tags", category_slug), ("perPage", "100")]
@@ -459,8 +470,9 @@ def telegram_notify(text):
 
 def telegram_cmd_generate(force):
     """Shared body of /generate and /regenerate -- mirrors generate()'s
-    plan-or-reuse logic but returns reply text instead of notifying."""
-    start, end = week_bounds()
+    plan-or-reuse logic but returns reply text instead of notifying, and
+    always targets next week (see next_week_bounds())."""
+    start, end = next_week_bounds()
     existing = get_existing_lunches(start, end)
 
     if existing and not force:
@@ -478,7 +490,7 @@ def telegram_cmd_generate(force):
 
 
 def telegram_cmd_sendplan():
-    start, end = week_bounds()
+    start, end = next_week_bounds()
     existing = get_existing_lunches(start, end)
     if not existing:
         return f"No plan exists yet for {start}..{end}. Use /generate first."
@@ -486,7 +498,7 @@ def telegram_cmd_sendplan():
 
 
 def telegram_cmd_sendshopping():
-    start, end = week_bounds()
+    start, end = next_week_bounds()
     existing = get_existing_lunches(start, end)
     shopping_plan = [{"recipe": e.get("recipe")} for e in existing]
     text = build_shopping_list(shopping_plan)
