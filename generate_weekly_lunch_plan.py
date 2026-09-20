@@ -516,6 +516,14 @@ def handle_telegram_command(chat_id, text):
 
 def telegram_poll_loop():
     log("Telegram bot: starting long-poll loop")
+    # getUpdates 409s permanently if a webhook is set on this token (the two
+    # are mutually exclusive) -- clear any leftover one defensively so a
+    # stray setWebhook call from testing doesn't silently disable the bot.
+    try:
+        telegram_api_request("deleteWebhook", {}, timeout=15)
+    except Exception as e:
+        log(f"WARNING: failed to clear Telegram webhook: {e}")
+
     offset = None
     while True:
         try:
@@ -523,6 +531,18 @@ def telegram_poll_loop():
             if offset is not None:
                 params["offset"] = offset
             resp = telegram_api_request("getUpdates", params, timeout=40)
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                # Telegram allows only one getUpdates poller per bot token --
+                # this means another instance (old container not yet torn
+                # down, or a second replica) is polling with the same token.
+                log("ERROR polling Telegram: HTTP 409 Conflict -- another "
+                    "process is already polling with this bot token")
+                time.sleep(15)
+            else:
+                log(f"ERROR polling Telegram: {e}")
+                time.sleep(5)
+            continue
         except Exception as e:
             log(f"ERROR polling Telegram: {e}")
             time.sleep(5)
